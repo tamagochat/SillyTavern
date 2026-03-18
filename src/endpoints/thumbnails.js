@@ -8,6 +8,7 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { imageSize as sizeOf } from 'image-size';
 
 import { getConfigValue, invalidateFirefoxCache } from '../util.js';
+import { getStorageProvider } from '../storage-provider.js';
 import { getThumbnailResolution, isAnimatedWebP, thumbnailDimensions as dimensions, isAnimatedApng } from './image-metadata.js';
 import { ResizeStrategy } from '@jimp/plugin-resize';
 
@@ -257,12 +258,22 @@ publicRouter.get('/', async function (request, response) {
         const file = sanitize(rawFile);
         if (file !== rawFile) return response.sendStatus(403);
 
-        const serveOriginal = () => {
+        const serveOriginal = async () => {
             const folder = getOriginalFolder(request.user.directories, type);
             const pathToOriginalFile = path.resolve(path.join(folder, file));
-            if (!fs.existsSync(pathToOriginalFile)) return response.sendStatus(404);
-            invalidateFirefoxCache(pathToOriginalFile, request, response);
-            return response.sendFile(pathToOriginalFile);
+            if (fs.existsSync(pathToOriginalFile)) {
+                invalidateFirefoxCache(pathToOriginalFile, request, response);
+                return response.sendFile(pathToOriginalFile);
+            }
+            // Try storage provider
+            const storageProvider = getStorageProvider();
+            const providerPath = type === 'bg' ? `backgrounds/${file}` : null;
+            if (storageProvider?.serveFile && providerPath) {
+                const handle = request.user.profile.handle;
+                const served = await storageProvider.serveFile(handle, providerPath, response);
+                if (served) return;
+            }
+            return response.sendStatus(404);
         };
 
         if (!thumbnailsEnabled) {
@@ -287,6 +298,21 @@ publicRouter.get('/', async function (request, response) {
 
         // Try to generate thumbnail if it doesn't exist
         if (!fs.existsSync(pathToCachedFile)) {
+            // If original isn't on the filesystem, fetch from storage provider
+            const originalFolder = getOriginalFolder(request.user.directories, type);
+            const pathToOriginalFile = path.join(originalFolder, file);
+            if (!fs.existsSync(pathToOriginalFile)) {
+                const storageProvider = getStorageProvider();
+                const providerPath = type === 'bg' ? `backgrounds/${file}` : null;
+                if (storageProvider?.readFile && providerPath) {
+                    const handle = request.user.profile.handle;
+                    const buffer = await storageProvider.readFile(handle, providerPath);
+                    if (buffer) {
+                        fs.mkdirSync(originalFolder, { recursive: true });
+                        fs.writeFileSync(pathToOriginalFile, buffer);
+                    }
+                }
+            }
             const thumbResult = await generateThumbnail(request.user.directories, type, file, false);
             // If generation failed (path is null), serve the original file
             if (!thumbResult.path) {
