@@ -19,6 +19,7 @@ import { TavernCardValidator } from '../validator/TavernCardValidator.js';
 import { parse, read, write } from '../character-card-parser.js';
 import { readWorldInfoFile } from './worldinfo.js';
 import { invalidateThumbnail } from './thumbnails.js';
+import { getStorageProvider } from '../storage-provider.js';
 import { importRisuSprites } from './sprites.js';
 import { getUserDirectories } from '../users.js';
 import { getChatInfo } from './chats.js';
@@ -1076,6 +1077,13 @@ router.post('/rename', validateAvatarUrlMiddleware, async function (request, res
             fs.rmSync(oldChatsPath, { recursive: true, force: true });
         }
 
+        // Rename chats in storage provider (DB)
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.renameCharacterChats) {
+            const handle = request.user.profile.handle;
+            await storageProvider.renameCharacterChats(handle, oldInternalName, newInternalName);
+        }
+
         // Remove the old character file
         fs.unlinkSync(oldAvatarPath);
 
@@ -1296,7 +1304,17 @@ router.post('/delete', validateAvatarUrlMiddleware, async function (request, res
             await fs.promises.rm(path.join(request.user.directories.chats, sanitize(dir_name)), { recursive: true, force: true });
         } catch (err) {
             console.error(err);
-            return response.sendStatus(500);
+        }
+
+        // Also delete chats from storage provider (DB)
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.deleteCharacterChats) {
+            try {
+                const handle = request.user.profile.handle;
+                await storageProvider.deleteCharacterChats(handle, dir_name);
+            } catch (err) {
+                console.error('Failed to delete chats from storage provider:', err);
+            }
         }
     }
 

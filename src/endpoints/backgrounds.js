@@ -8,16 +8,37 @@ import { invalidateThumbnail } from './thumbnails.js';
 import { getOrGenerateMetadataBatch, removeMetadata, renameMetadata, thumbnailDimensions } from './image-metadata.js';
 import { getImages } from '../util.js';
 import { getFileNameValidationFunction } from '../middleware/validateFileName.js';
+import { getStorageProvider } from '../storage-provider.js';
 
 export const router = express.Router();
 
 router.post('/all', async function (request, response) {
-    const images = getImages(request.user.directories.backgrounds);
-    const config = { width: thumbnailDimensions.bg[0], height: thumbnailDimensions.bg[1] };
-    response.json({ images, config });
+    try {
+        const localImages = getImages(request.user.directories.backgrounds);
+
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.listBackgrounds) {
+            const handle = request.user.profile.handle;
+            const remoteImages = await storageProvider.listBackgrounds(handle);
+            // Merge local + remote, deduplicate by filename
+            const seen = new Set(localImages);
+            for (const img of remoteImages) {
+                if (!seen.has(img)) {
+                    localImages.push(img);
+                    seen.add(img);
+                }
+            }
+        }
+
+        const config = { width: thumbnailDimensions.bg[0], height: thumbnailDimensions.bg[1] };
+        response.json({ images: localImages, config });
+    } catch (error) {
+        console.error('Error listing backgrounds:', error);
+        response.status(500).send({ error: 'Failed to list backgrounds' });
+    }
 });
 
-router.post('/delete', getFileNameValidationFunction('bg'), function (request, response) {
+router.post('/delete', getFileNameValidationFunction('bg'), async function (request, response) {
     if (!request.body) return response.sendStatus(400);
 
     if (request.body.bg !== sanitize(request.body.bg)) {
@@ -25,7 +46,22 @@ router.post('/delete', getFileNameValidationFunction('bg'), function (request, r
         return response.sendStatus(403);
     }
 
-    const fileName = path.join(request.user.directories.backgrounds, sanitize(request.body.bg));
+    const bgName = sanitize(request.body.bg);
+
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.deleteFile) {
+        try {
+            const handle = request.user.profile.handle;
+            await storageProvider.deleteFile(handle, `backgrounds/${bgName}`);
+            invalidateThumbnail(request.user.directories, 'bg', bgName);
+            return response.send('ok');
+        } catch (err) {
+            console.error('Error deleting background from storage provider:', err);
+            return response.sendStatus(500);
+        }
+    }
+
+    const fileName = path.join(request.user.directories.backgrounds, bgName);
 
     if (!fs.existsSync(fileName)) {
         console.error('BG file not found');
@@ -33,7 +69,7 @@ router.post('/delete', getFileNameValidationFunction('bg'), function (request, r
     }
 
     fs.unlinkSync(fileName);
-    invalidateThumbnail(request.user.directories, 'bg', request.body.bg);
+    invalidateThumbnail(request.user.directories, 'bg', bgName);
 
     // Remove metadata for deleted image
     const relativePath = path.join('backgrounds', request.body.bg);
@@ -44,11 +80,27 @@ router.post('/delete', getFileNameValidationFunction('bg'), function (request, r
     return response.send('ok');
 });
 
-router.post('/rename', function (request, response) {
+router.post('/rename', async function (request, response) {
     if (!request.body) return response.sendStatus(400);
 
-    const oldFileName = path.join(request.user.directories.backgrounds, sanitize(request.body.old_bg));
-    const newFileName = path.join(request.user.directories.backgrounds, sanitize(request.body.new_bg));
+    const oldBgName = sanitize(request.body.old_bg);
+    const newBgName = sanitize(request.body.new_bg);
+
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.renameBackground) {
+        try {
+            const handle = request.user.profile.handle;
+            await storageProvider.renameBackground(handle, oldBgName, newBgName);
+            invalidateThumbnail(request.user.directories, 'bg', oldBgName);
+            return response.send('ok');
+        } catch (err) {
+            console.error('Error renaming background in storage provider:', err);
+            return response.sendStatus(500);
+        }
+    }
+
+    const oldFileName = path.join(request.user.directories.backgrounds, oldBgName);
+    const newFileName = path.join(request.user.directories.backgrounds, newBgName);
 
     if (!fs.existsSync(oldFileName)) {
         console.error('BG file not found');
@@ -74,13 +126,23 @@ router.post('/rename', function (request, response) {
     return response.send('ok');
 });
 
-router.post('/upload', function (request, response) {
+router.post('/upload', async function (request, response) {
     if (!request.body || !request.file) return response.sendStatus(400);
 
     const img_path = path.join(request.file.destination, request.file.filename);
     const filename = sanitize(request.file.originalname);
 
     try {
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.saveFile) {
+            const handle = request.user.profile.handle;
+            const buffer = fs.readFileSync(img_path);
+            await storageProvider.saveFile(handle, `backgrounds/${filename}`, buffer);
+            fs.unlinkSync(img_path);
+            invalidateThumbnail(request.user.directories, 'bg', filename);
+            return response.send(filename);
+        }
+
         fs.copyFileSync(img_path, path.join(request.user.directories.backgrounds, filename));
         fs.unlinkSync(img_path);
         invalidateThumbnail(request.user.directories, 'bg', filename);
