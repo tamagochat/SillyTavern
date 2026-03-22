@@ -267,7 +267,7 @@ publicRouter.get('/', async function (request, response) {
             }
             // Try storage provider
             const storageProvider = getStorageProvider();
-            const providerPath = type === 'bg' ? `backgrounds/${file}` : null;
+            const providerPath = type === 'bg' ? `backgrounds/${file}` : type === 'avatar' ? `characters/${file}` : null;
             if (storageProvider?.serveFile && providerPath) {
                 const handle = request.user.profile.handle;
                 const served = await storageProvider.serveFile(handle, providerPath, response);
@@ -303,7 +303,7 @@ publicRouter.get('/', async function (request, response) {
             const pathToOriginalFile = path.join(originalFolder, file);
             if (!fs.existsSync(pathToOriginalFile)) {
                 const storageProvider = getStorageProvider();
-                const providerPath = type === 'bg' ? `backgrounds/${file}` : null;
+                const providerPath = type === 'bg' ? `backgrounds/${file}` : type === 'avatar' ? `characters/${file}` : null;
                 if (storageProvider?.readFile && providerPath) {
                     const handle = request.user.profile.handle;
                     const buffer = await storageProvider.readFile(handle, providerPath);

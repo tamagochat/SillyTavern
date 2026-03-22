@@ -8,6 +8,7 @@ import { sync as writeFileAtomicSync, default as writeFileAtomic } from 'write-f
 
 import { color, tryParse } from '../util.js';
 import { getFileNameValidationFunction } from '../middleware/validateFileName.js';
+import { getStorageProvider } from '../storage-provider.js';
 
 export const router = express.Router();
 
@@ -110,15 +111,17 @@ export async function migrateGroupChatsMetadataFormat(userDirectories) {
     }
 }
 
-router.post('/all', (request, response) => {
+router.post('/all', async (request, response) => {
     const groups = [];
 
+    // Load groups from local filesystem
     if (!fs.existsSync(request.user.directories.groups)) {
         fs.mkdirSync(request.user.directories.groups);
     }
 
     const files = fs.readdirSync(request.user.directories.groups).filter(x => path.extname(x) === '.json');
     const chats = fs.readdirSync(request.user.directories.groupChats).filter(x => path.extname(x) === '.jsonl');
+    const seenIds = new Set();
 
     files.forEach(function (file) {
         try {
@@ -145,16 +148,38 @@ router.post('/all', (request, response) => {
             group.date_last_chat = date_last_chat;
             group.chat_size = chat_size;
             groups.push(group);
+            if (group.id) seenIds.add(group.id);
         }
         catch (error) {
             console.error(error);
         }
     });
 
+    // Merge groups from storage provider (S3)
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.listGroups) {
+        try {
+            const handle = request.user.profile.handle;
+            const remoteGroups = await storageProvider.listGroups(handle);
+            for (const group of remoteGroups) {
+                if (group.id && !seenIds.has(group.id)) {
+                    group.date_added = group.date_added || Date.now();
+                    group.create_date = group.create_date || new Date().toISOString();
+                    group.date_last_chat = group.date_last_chat || 0;
+                    group.chat_size = group.chat_size || 0;
+                    groups.push(group);
+                    seenIds.add(group.id);
+                }
+            }
+        } catch (err) {
+            console.error('Error listing groups from storage provider:', err);
+        }
+    }
+
     return response.send(groups);
 });
 
-router.post('/create', (request, response) => {
+router.post('/create', async (request, response) => {
     if (!request.body) {
         return response.sendStatus(400);
     }
@@ -185,10 +210,22 @@ router.post('/create', (request, response) => {
     }
 
     writeFileAtomicSync(pathToFile, fileData);
+
+    // Also save to storage provider
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.saveGroup) {
+        try {
+            const handle = request.user.profile.handle;
+            await storageProvider.saveGroup(handle, id, fileData);
+        } catch (err) {
+            console.error('Error saving group to storage provider:', err);
+        }
+    }
+
     return response.send(groupMetadata);
 });
 
-router.post('/edit', getFileNameValidationFunction('id'), (request, response) => {
+router.post('/edit', getFileNameValidationFunction('id'), async (request, response) => {
     if (!request.body || !request.body.id) {
         return response.sendStatus(400);
     }
@@ -198,6 +235,18 @@ router.post('/edit', getFileNameValidationFunction('id'), (request, response) =>
     const fileData = JSON.stringify(request.body, null, 4);
 
     writeFileAtomicSync(pathToFile, fileData);
+
+    // Also save to storage provider
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.saveGroup) {
+        try {
+            const handle = request.user.profile.handle;
+            await storageProvider.saveGroup(handle, id, fileData);
+        } catch (err) {
+            console.error('Error saving group to storage provider:', err);
+        }
+    }
+
     return response.send({ ok: true });
 });
 
@@ -211,15 +260,36 @@ router.post('/delete', getFileNameValidationFunction('id'), async (request, resp
 
     try {
         // Delete group chats
-        const group = JSON.parse(fs.readFileSync(pathToGroup, 'utf8'));
+        let groupData = null;
+        if (fs.existsSync(pathToGroup)) {
+            groupData = JSON.parse(fs.readFileSync(pathToGroup, 'utf8'));
+        }
 
-        if (group && Array.isArray(group.chats)) {
-            for (const chat of group.chats) {
+        // Try storage provider if not found locally
+        const storageProvider = getStorageProvider();
+        if (!groupData && storageProvider?.readGroup) {
+            const handle = request.user.profile.handle;
+            const raw = await storageProvider.readGroup(handle, id);
+            if (raw) groupData = JSON.parse(raw);
+        }
+
+        if (groupData && Array.isArray(groupData.chats)) {
+            for (const chat of groupData.chats) {
                 console.info('Deleting group chat', chat);
                 const pathToFile = path.join(request.user.directories.groupChats, sanitize(`${chat}.jsonl`));
 
                 if (fs.existsSync(pathToFile)) {
                     fs.unlinkSync(pathToFile);
+                }
+
+                // Also delete from storage provider (DB)
+                if (storageProvider?.deleteChat) {
+                    try {
+                        const handle = request.user.profile.handle;
+                        await storageProvider.deleteChat(handle, '__group__', `${chat}.jsonl`);
+                    } catch (err) {
+                        console.error(`Failed to delete group chat ${chat} from storage provider:`, err);
+                    }
                 }
             }
         }
@@ -227,8 +297,20 @@ router.post('/delete', getFileNameValidationFunction('id'), async (request, resp
         console.error('Could not delete group chats. Clean them up manually.', error);
     }
 
+    // Delete group definition from filesystem
     if (fs.existsSync(pathToGroup)) {
         fs.unlinkSync(pathToGroup);
+    }
+
+    // Delete group definition from storage provider
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.deleteGroup) {
+        try {
+            const handle = request.user.profile.handle;
+            await storageProvider.deleteGroup(handle, id);
+        } catch (err) {
+            console.error('Error deleting group from storage provider:', err);
+        }
     }
 
     return response.send({ ok: true });

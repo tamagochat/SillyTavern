@@ -317,8 +317,21 @@ function importRisuChat(userName, characterName, jsonData) {
  * @returns {Promise<boolean>} Whether the chat is intact
  */
 async function checkChatIntegrity(filePath, integritySlug) {
-    // If the chat file doesn't exist, assume it's intact
+    // If the chat file doesn't exist, try reading from storage provider
     if (!fs.existsSync(filePath)) {
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.readChat) {
+            const fileName = path.basename(filePath);
+            const characterName = path.basename(path.dirname(filePath));
+            const data = await storageProvider.readChat(null, characterName, fileName);
+            if (data) {
+                const firstLine = data.split('\n')[0];
+                const jsonData = tryParse(firstLine);
+                const chatIntegrity = jsonData?.chat_metadata?.integrity;
+                if (!chatIntegrity) return true;
+                return chatIntegrity === integritySlug;
+            }
+        }
         return true;
     }
 
