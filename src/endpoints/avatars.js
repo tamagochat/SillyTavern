@@ -10,16 +10,36 @@ import { getImages, tryParse } from '../util.js';
 import { getFileNameValidationFunction } from '../middleware/validateFileName.js';
 import { applyAvatarCropResize } from './characters.js';
 import { invalidateThumbnail } from './thumbnails.js';
+import { getStorageProvider } from '../storage-provider.js';
 import cacheBuster from '../middleware/cacheBuster.js';
 
 export const router = express.Router();
 
-router.post('/get', function (request, response) {
-    const images = getImages(request.user.directories.avatars);
-    response.send(images);
+router.post('/get', async function (request, response) {
+    try {
+        const localImages = getImages(request.user.directories.avatars);
+
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.listAvatars) {
+            const handle = request.user.profile.handle;
+            const remoteAvatars = await storageProvider.listAvatars(handle);
+            const seen = new Set(localImages);
+            for (const img of remoteAvatars) {
+                if (!seen.has(img)) {
+                    localImages.push(img);
+                    seen.add(img);
+                }
+            }
+        }
+
+        response.send(localImages);
+    } catch (error) {
+        console.error('Error listing avatars:', error);
+        response.status(500).send({ error: 'Failed to list avatars' });
+    }
 });
 
-router.post('/delete', getFileNameValidationFunction('avatar'), function (request, response) {
+router.post('/delete', getFileNameValidationFunction('avatar'), async function (request, response) {
     if (!request.body) return response.sendStatus(400);
 
     if (request.body.avatar !== sanitize(request.body.avatar)) {
@@ -27,11 +47,26 @@ router.post('/delete', getFileNameValidationFunction('avatar'), function (reques
         return response.sendStatus(403);
     }
 
-    const fileName = path.join(request.user.directories.avatars, sanitize(request.body.avatar));
+    const avatarName = sanitize(request.body.avatar);
+
+    const storageProvider = getStorageProvider();
+    if (storageProvider?.deleteFile) {
+        try {
+            const handle = request.user.profile.handle;
+            await storageProvider.deleteFile(handle, `User Avatars/${avatarName}`);
+            invalidateThumbnail(request.user.directories, 'persona', avatarName);
+            return response.send({ result: 'ok' });
+        } catch (err) {
+            console.error('Error deleting avatar from storage provider:', err);
+            return response.sendStatus(500);
+        }
+    }
+
+    const fileName = path.join(request.user.directories.avatars, avatarName);
 
     if (fs.existsSync(fileName)) {
         fs.unlinkSync(fileName);
-        invalidateThumbnail(request.user.directories, 'persona', sanitize(request.body.avatar));
+        invalidateThumbnail(request.user.directories, 'persona', avatarName);
         return response.send({ result: 'ok' });
     }
 
@@ -54,6 +89,15 @@ router.post('/upload', getFileNameValidationFunction('overwrite_name'), async (r
         }
 
         const filename = sanitize(request.body.overwrite_name || `${Date.now()}.png`);
+
+        const storageProvider = getStorageProvider();
+        if (storageProvider?.saveFile) {
+            const handle = request.user.profile.handle;
+            await storageProvider.saveFile(handle, `User Avatars/${filename}`, image);
+            fs.unlinkSync(pathToUpload);
+            return response.send({ path: filename });
+        }
+
         const pathToNewFile = path.join(request.user.directories.avatars, filename);
         writeFileAtomicSync(pathToNewFile, image);
         fs.unlinkSync(pathToUpload);
